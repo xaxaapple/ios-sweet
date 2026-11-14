@@ -1,0 +1,264 @@
+name: sweet-images
+# One button -> the two files that go to the phone:
+#   shim-boot.img         for `fastboot boot`          (job "boot", ~10 min)
+#   ios16-root.simg(.zst) for `fastboot flash userdata` (job "root", ~1-2 h)
+# The kernel is NOT rebuilt here (it needs macOS and ~1 h): the newest successful `xnu` run is reused,
+# or pass its run id. Phone-specific files (stock DTB, GPU firmware) come from device/ in this
+# repository: see device/README.md. With gpu=true the native Metal bundle is built on macOS
+# (sweet-native-metal) and installed into the root; the boot image gets the GPU firmware + boot-args.
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_run_id:
+        description: "Run id of the xnu workflow to take the kernel from (empty = newest successful run with an xnu-kernel artifact)"
+        type: string
+        default: ""
+      kernel_file:
+        description: "File inside the xnu-kernel artifact"
+        type: string
+        default: "kernel.development.sweet"
+      build_boot:
+        description: "Build shim-boot.img"
+        type: boolean
+        default: true
+      build_root:
+        description: "Build the iOS root image (ios16-root.simg)"
+        type: boolean
+        default: true
+      only_preflight:
+        description: "Only run the 3-minute self-test of the runner, build nothing"
+        type: boolean
+        default: false
+      gpu:
+        description: "GPU acceleration: GMU/SQE/ZAP from device/firmware/gpu into the boot image + boot-args, and the native Metal bundle into the root"
+        type: boolean
+        default: true
+      gpu_boot_args:
+        description: "Boot-args added when gpu=true"
+        type: string
+        default: "sweetgpu=9 sweetmtl=2 sweetgles=0"
+      metal_run_id:
+        description: "Run id of an existing sweet-native-metal run to reuse (empty = build the bundle now, macOS, ~1 h)"
+        type: string
+        default: ""
+      cmdline_extra:
+        description: "Extra boot-args appended to the base command line from README step 3"
+        type: string
+        default: ""
+      root_size:
+        description: "Size of the HFS+ volume in the root image"
+        type: string
+        default: "16G"
+      ipsw_url:
+        description: "Override the IPSW URL (empty = ipsw.me / Apple CDN)"
+        type: string
+        default: ""
+      ipsw_sha256:
+        description: "SHA-256 for the overridden IPSW URL"
+        type: string
+        default: ""
+      runner:
+        description: "Runner label (ubuntu-24.04, or a larger Linux runner)"
+        type: string
+        default: "ubuntu-24.04"
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: sweet-images-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  preflight:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Runner space
+        run: bash tools/ci/prepare-runner.sh 10
+      - name: Packages
+        run: bash tools/ci/install-deps.sh
+      - name: Self-test (HFS+ loop mount, FUSE, mkbootimg, img2simg)
+        run: bash tools/ci/preflight.sh
+
+  boot:
+    needs: preflight
+    if: ${{ !inputs.only_preflight && inputs.build_boot }}
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Packages
+        run: bash tools/ci/install-deps.sh
+
+      - name: Find the IPSW (only DeviceTree.d22ap.im4p is read from it here)
+        id: ipsw
+        env:
+          IPSW_URL: ${{ inputs.ipsw_url }}
+          IPSW_SHA: ${{ inputs.ipsw_sha256 }}
+        run: |
+          args=()
+          [ -n "$IPSW_URL" ] && args+=(--url "$IPSW_URL" --sha256 "$IPSW_SHA")
+          python3 tools/ci/resolve-ipsw.py "${args[@]}"
+
+      - name: Pick and download the kernel
+        id: kernel
+        env:
+          KERNEL_RUN_ID: ${{ inputs.kernel_run_id }}
+          KERNEL_FILE: ${{ inputs.kernel_file }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          run_id="$KERNEL_RUN_ID"
+          if [ -z "$run_id" ]; then
+            for id in $(gh run list --workflow xnu.yml --branch "$DEFAULT_BRANCH" --status success \
+                          --limit 40 --json databaseId --jq '.[].databaseId'); do
+              n=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$id/artifacts" \
+                    --jq '[.artifacts[] | select(.name=="xnu-kernel" and (.expired|not))] | length')
+              if [ "$n" -gt 0 ]; then run_id=$id; break; fi
+            done
+          fi
+          if [ -z "$run_id" ]; then
+            echo "::error::No successful xnu run with a live xnu-kernel artifact. Run the 'xnu' workflow first (Actions > xnu > Run workflow), then start this one."
+            exit 1
+          fi
+          sha=$(gh run view "$run_id" --json headSha --jq .headSha)
+          echo "Kernel from run $run_id (commit $sha); this workflow runs on $GITHUB_SHA"
+          if [ "$sha" != "$GITHUB_SHA" ]; then
+            echo "::warning::The kernel was built from $sha but shim/tools are from $GITHUB_SHA. If boot breaks, rebuild the kernel on the current commit."
+          fi
+          gh run download "$run_id" -n xnu-kernel -D "$RUNNER_TEMP/kernel"
+          (cd "$RUNNER_TEMP/kernel" && ls -l && { [ ! -f SHA256SUMS ] || sha256sum -c SHA256SUMS --ignore-missing; })
+          test -f "$RUNNER_TEMP/kernel/$KERNEL_FILE" || { echo "::error::$KERNEL_FILE not in the artifact"; ls "$RUNNER_TEMP/kernel"; exit 1; }
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+          echo "path=$RUNNER_TEMP/kernel/$KERNEL_FILE" >> "$GITHUB_OUTPUT"
+
+      - name: Phone files in device/
+        run: ls -laR device | head -50
+
+      - name: Install ipsw (blacktop, latest release)
+        run: |
+          set -euo pipefail
+          d="$RUNNER_TEMP/ipsw-dl"; mkdir -p "$d"
+          gh release download --repo blacktop/ipsw --pattern 'ipsw_*_linux_x86_64.tar.gz' --dir "$d"
+          tar -xzf "$d"/ipsw_*_linux_x86_64.tar.gz -C "$d"
+          sudo install -m 0755 "$(find "$d" -type f -name ipsw | head -1)" /usr/local/bin/ipsw
+          ipsw version
+
+      - name: Build shim-boot.img
+        env:
+          KERNEL: ${{ steps.kernel.outputs.path }}
+          KERNEL_RUN_ID: ${{ steps.kernel.outputs.run_id }}
+          IPSW_URL: ${{ steps.ipsw.outputs.url }}
+          CMDLINE_EXTRA: ${{ inputs.cmdline_extra }}
+          GPU_FIRMWARE: ${{ inputs.gpu }}
+          GPU_BOOT_ARGS: ${{ inputs.gpu_boot_args }}
+          OUT: ${{ github.workspace }}/out-boot
+        run: bash tools/ci/build-boot-image.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sweet-boot-image
+          path: out-boot/
+          retention-days: 3
+          if-no-files-found: error
+
+      - name: Summary
+        run: |
+          {
+            echo "### shim-boot.img"
+            echo
+            echo '```'
+            sha256sum out-boot/shim-boot.img
+            echo '```'
+            echo
+            echo 'On the phone (fastboot): `fastboot boot shim-boot.img`'
+            echo
+            echo '```json'
+            cat out-boot/manifest.json
+            echo
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  metal:
+    needs: preflight
+    if: ${{ !inputs.only_preflight && inputs.build_root && inputs.gpu && inputs.metal_run_id == '' }}
+    uses: ./.github/workflows/native-metal.yml
+
+  root:
+    needs: [preflight, metal]
+    if: ${{ !cancelled() && needs.preflight.result == 'success' && (needs.metal.result == 'success' || needs.metal.result == 'skipped') && !inputs.only_preflight && inputs.build_root }}
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: "Runner space (about 45 GB peak - IPSW, DMGs, 16 GB image, sparse copy)"
+        run: bash tools/ci/prepare-runner.sh 60
+
+      - name: Packages
+        run: bash tools/ci/install-deps.sh
+
+      - name: Find the IPSW
+        id: ipsw
+        env:
+          IPSW_URL: ${{ inputs.ipsw_url }}
+          IPSW_SHA: ${{ inputs.ipsw_sha256 }}
+        run: |
+          args=()
+          [ -n "$IPSW_URL" ] && args+=(--url "$IPSW_URL" --sha256 "$IPSW_SHA")
+          python3 tools/ci/resolve-ipsw.py "${args[@]}"
+
+      - name: Native Metal bundle (built in this run)
+        if: ${{ inputs.gpu && inputs.metal_run_id == '' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: sweet-native-metal-ios16
+          path: ${{ runner.temp }}/metal
+
+      - name: Native Metal bundle (from the run you named)
+        if: ${{ inputs.gpu && inputs.metal_run_id != '' }}
+        env:
+          METAL_RUN_ID: ${{ inputs.metal_run_id }}
+        run: gh run download "$METAL_RUN_ID" -n sweet-native-metal-ios16 -D "$RUNNER_TEMP/metal"
+
+      - name: Check the Metal bundle
+        if: ${{ inputs.gpu }}
+        run: |
+          set -euo pipefail
+          find "$RUNNER_TEMP/metal" -maxdepth 3 | head -20
+          test -f "$RUNNER_TEMP/metal/native-legacy/build.json"
+          test -d "$RUNNER_TEMP/metal/native-legacy/SweetMetal2.bundle"
+
+      - name: Build the root image
+        env:
+          IPSW_URL: ${{ steps.ipsw.outputs.url }}
+          IPSW_SHA256: ${{ steps.ipsw.outputs.sha256 }}
+          ROOT_SIZE: ${{ inputs.root_size }}
+          GPU_BUNDLE_DIR: ${{ inputs.gpu && format('{0}/metal', runner.temp) || '' }}
+        run: bash tools/ci/build-root-image.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sweet-ios16-root
+          path: ${{ env.WORK }}/out-root/
+          retention-days: 2
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: Summary
+        run: |
+          {
+            echo "### iOS root image"
+            echo
+            echo "Download the artifact, then (Linux):"
+            echo '```'
+            cat "$WORK/out-root/RESTORE.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
