@@ -1,0 +1,44 @@
+diff --git a/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp b/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
+index 24aa905..7ec5f02 100644
+--- a/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
++++ b/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
+@@ -633,6 +633,7 @@ extern "C" int sweet_native_adreno_publish(NativeAdrenoVm *vm,NativeAdrenoSubmit
+     hand) so the fresh process finds MetalPluginName. */
+  int restart=1;PE_parse_boot_argn("sweetm2restart",&restart,sizeof(restart));
+  if(gles!=1 && restart==1) {
++  bool killed_backboardd=false;
+   for(int pid=1;pid<99999;pid++) {
+    proc_t p=proc_find(pid);
+    if(!p)continue;
+@@ -641,9 +642,31 @@ extern "C" int sweet_native_adreno_publish(NativeAdrenoVm *vm,NativeAdrenoSubmit
+    proc_rele(p);
+    if(match) {
+     IOLog("SWEET RENDER: restarted backboardd for Metal discovery\n");
++    killed_backboardd=true;
+     break;
+    }
+   }
++  /* On a slow first boot SpringBoard is still blocked in its synchronous
++     BKSSystemShellService check-in when the old backboardd is killed. The
++     request died with that process and nothing ever answers it (every sampler
++     snapshot shows the same SpringBoard stack for 30+ minutes), so the screen
++     stays on the backboardd spinner forever. Restart SpringBoard together with
++     backboardd; launchd respawns it and it checks in with the new backboardd.
++     sweetsbrestart=0 turns this off. */
++  int sbrestart=1;PE_parse_boot_argn("sweetsbrestart",&sbrestart,sizeof(sbrestart));
++  if(killed_backboardd && sbrestart==1) {
++   for(int pid=1;pid<99999;pid++) {
++    proc_t p=proc_find(pid);
++    if(!p)continue;
++    const bool match=!strcmp(proc_best_name(p),"SpringBoard");
++    if(match)proc_signal(pid,SIGKILL);
++    proc_rele(p);
++    if(match) {
++     IOLog("SWEET RENDER: restarted SpringBoard after backboardd\n");
++     break;
++    }
++   }
++  }
+  }
+  return 0;
+ }
