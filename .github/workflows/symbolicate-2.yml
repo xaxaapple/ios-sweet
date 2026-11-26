@@ -1,0 +1,127 @@
+name: sweet-symbolicate
+
+# Names the stack frames the kernel sampler prints ("SMP ... bt 0x..." lines of boot.txt).
+# The shared cache and its symbols come from the IPSW of tools/sweet-root-tweaks.py's iOS build;
+# frames inside backboardd / SpringBoard / datamigrator get a disassembly window around the call.
+# Result: symbolicated.txt as the artifact "sweet-symbolicated" (plus the first lines in the job summary). Takes about 25 minutes (IPSW download + APFS read).
+#
+# Input: the SMP lines from boot.txt. A workflow input is cut at 1024 characters, so put the lines into a
+# file of the repository (default research/smp-input.txt, one SMP record per line) and leave smp_text empty.
+on:
+  workflow_dispatch:
+    inputs:
+      smp_text:
+        description: "SMP lines joined with ';' (a GitHub input holds at most 1024 characters; empty = use smp_file)"
+        type: string
+        default: ""
+      smp_file:
+        description: "File in the repository with the SMP lines (used when smp_text is empty)"
+        type: string
+        default: "research/smp-input.txt"
+      ipsw_url:
+        description: "IPSW URL (empty = the build of tools/sweet-root-tweaks.py, found via ipsw.me)"
+        type: string
+        default: ""
+      ipsw_sha256:
+        description: "SHA-256 of that IPSW (needed with ipsw_url)"
+        type: string
+        default: ""
+      runner:
+        description: "Runner label"
+        type: string
+        default: "ubuntu-24.04"
+
+permissions:
+  contents: read
+
+jobs:
+  symbolicate:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Runner space
+        run: bash tools/ci/prepare-runner.sh 50
+
+      - name: Packages
+        run: |
+          bash tools/ci/install-deps.sh
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends llvm
+
+      - name: Find the IPSW
+        id: ipsw
+        env:
+          IPSW_URL: ${{ inputs.ipsw_url }}
+          IPSW_SHA: ${{ inputs.ipsw_sha256 }}
+        run: |
+          args=()
+          [ -n "$IPSW_URL" ] && args+=(--url "$IPSW_URL" --sha256 "$IPSW_SHA")
+          python3 tools/ci/resolve-ipsw.py "${args[@]}"
+
+      - name: Download the IPSW and extract the disk images
+        env:
+          IPSW_URL: ${{ steps.ipsw.outputs.url }}
+          IPSW_SHA256: ${{ steps.ipsw.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$WORK/ipsw"
+          curl -fL --retry 8 --retry-delay 15 --retry-all-errors -C - -o "$WORK/ipsw/restore.ipsw" "$IPSW_URL"
+          echo "$IPSW_SHA256  $WORK/ipsw/restore.ipsw" | sha256sum -c -
+          python3 tools/ci/ipsw-images.py "$WORK/ipsw/restore.ipsw" "$WORK/ipsw"
+          rm -f "$WORK/ipsw/restore.ipsw"
+          ls -l "$WORK/ipsw"
+
+      - name: APFS reader
+        run: JOBS=$(nproc) bash tools/build-apfs-reader.sh
+
+      - name: Symbolicate
+        env:
+          SMP_TEXT: ${{ inputs.smp_text }}
+          SMP_FILE: ${{ inputs.smp_file }}
+        run: |
+          set -euo pipefail
+          if [ -n "$SMP_TEXT" ]; then smp_arg="$SMP_TEXT"; else smp_arg="@$GITHUB_WORKSPACE/$SMP_FILE"; fi
+          export APFS_FUSE="$PWD/research/apfs-fuse-current/build/apfs-fuse"
+          test -x "$APFS_FUSE"
+          m="$WORK/mnt"; mkdir -p "$m"
+          # apfs-fuse only parses UDIF images when the name ends in .dmg
+          for n in os sysos; do
+            ln -s "$WORK/ipsw/$n.dmg" "$m/$n.dmg"; mkdir "$m/$n"
+            sudo "$APFS_FUSE" "$m/$n.dmg" "$m/$n"
+          done
+          dsc="$m/sysos/root/System/Library/Caches/com.apple.dyld"
+          echo "shared cache directory:"; sudo ls -l "$dsc" | head -20
+          bins=()
+          add() { # add SAMPLER-NAME FILE-NAME
+            local f; f=$(sudo find "$m/os/root" -type f -name "$2" 2>/dev/null | head -1 || true)
+            [ -z "$f" ] || { echo "binary $1: $f"; bins+=(--bin "$1=$f"); }
+          }
+          add backboardd backboardd
+          add SpringBoard SpringBoard
+          add com.apple.datami com.apple.datamigrator
+          add com.apple.migrat com.apple.migrationpluginwrapper
+          objdump=$(ls /usr/bin/llvm-objdump* | head -1)
+          out="$RUNNER_TEMP/out"; mkdir -p "$out"
+          sudo python3 tools/ci/smp-symbolicate.py "$dsc" "$smp_arg" "${bins[@]}" --disasm "$objdump" 2>&1 \
+            | tee "$out/symbolicated.txt"
+          {
+            echo "### Symbolicated stacks"
+            echo
+            echo "The full text is in the artifact **sweet-symbolicated** (symbolicated.txt) at the bottom of this page."
+            echo
+            echo "First lines:"
+            echo '```'
+            head -n 40 "$out/symbolicated.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          for n in sysos os; do sudo umount "$m/$n" 2>/dev/null || true; done
+
+      - name: Upload symbolicated.txt as an artifact
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: sweet-symbolicated
+          path: ${{ runner.temp }}/out/symbolicated.txt
+          retention-days: 7
+          if-no-files-found: warn
